@@ -1,0 +1,417 @@
+# Brain-to-Brain Statistical Analysis
+
+```{r library, include = FALSE}
+library(tidyverse)
+library(ggeffects)
+library(lme4)
+library(lmerTest)
+library(buildmer)
+library(emmeans)
+library(here)
+```
+
+```{r loadFunctions, include = F}
+source(here("functions", "load_or_fit.R"))
+```
+
+```{r setup, include = FALSE }
+# Options for scientific notation and decimal places
+options(scipen = 999, digits = 3)
+
+# Specify which packages to use for masked functions
+# rescale <- arm::rescale
+lmer <- lmerTest::lmer
+select <- dplyr::select
+
+# Change optimizer parameter
+strict_tol <- lmerControl(optCtrl = list(xtol_abs = 1e-8, ftol_abs = 1e-8))
+
+# Set global options
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(dpi = 600)
+```
+
+```{r, include = F}
+roi_mapping <- list(
+  "Left anterior" = c("Fp1", "F3", "F7"),
+  "Right anterior" = c("Fp2", "F4", "F8"),
+  "Medial anterior" = c("Fz", "FCz", "FC1", "FC2"),
+  "Medial central" = c("C3", "Cz", "C4", "CP1", "CP2"),
+  "Left temporal" = c("FC5", "T7", "CP5"),
+  "Right temporal" = c("FC6", "T8", "CP6")
+)
+
+roi_ord = c("Left anterior", "Right anterior", "Medial anterior", "Medial central", "Left temporal", "Right temporal")
+
+# Reverse the mapping
+electrode_to_roi <- unlist(lapply(names(roi_mapping), 
+                                  function(x) setNames(rep(x, length(roi_mapping[[x]])),
+                                                       roi_mapping[[x]])))
+
+# Create a dataframe from the mapping
+roi_df <- data.frame(chlabel = names(electrode_to_roi), 
+                     roi = electrode_to_roi, 
+                     stringsAsFactors = FALSE
+) 
+```
+
+## Load + wrangle data
+
+```{r loadWrangleData}
+gcmi_df <- readRDS(here("data", "brain2brain_gcmi_piq_df.rds"))
+
+gcmi_tidy <- 
+  gcmi_df %>% 
+  mutate(SyncMI = pmax(SyncMI, 0),
+         RcrrMI = pmax(RcrrMI, 0)) %>% 
+  filter(Type %in% c("LowInterest", "HighInterest")) %>% 
+  left_join(roi_df, by = c("Channel_A" = "chlabel")) %>%
+  rename(Spk_ROI = roi) %>%
+  left_join(roi_df, by = c("Channel_B" = "chlabel")) %>%
+  rename(Lnr_ROI = roi) %>% 
+  mutate(
+    Lnr_ROI = factor(Lnr_ROI, levels = roi_ord),
+    Spk_ROI = factor(Spk_ROI, levels = roi_ord)) %>% 
+  mutate(ROI_pair = factor(paste(Spk_ROI, Lnr_ROI, sep = "_"))) %>% 
+  filter(!is.na(Spk_ROI) & !is.na(Lnr_ROI)) %>% 
+  mutate(sqrtSyncMI = sqrt(SyncMI),
+         sqrtRcrrMI = sqrt(RcrrMI),
+         stdPIQ = as.numeric(scale(sharedPIQ)),
+         stdSqSyncMI = as.numeric(scale(sqrtSyncMI)),
+         stdSqRcrrMI = as.numeric(scale(sqrtRcrrMI))) %>% 
+  droplevels()
+
+alpha_df <- gcmi_tidy %>% filter(FrequencyBand == "alpha")
+theta_df <- gcmi_tidy %>% filter(FrequencyBand == "theta")
+
+# saveRDS(gcmi_tidy, here("..", "8_Dissemination", "Writeup Draft", "Results Section RMD", "data", "b2b_gcmi_tidy.RDS"))
+```
+
+## LMMs
+
+### Misc prep
+```{r}
+# Contrast coding of ROI pairs
+contrasts(gcmi_tidy$ROI_pair) <- contr.helmert(length(unique(gcmi_tidy$ROI_pair)))
+
+models_base_dir = here("models2")
+```
+
+### Alpha band
+
+#### Concurrent (Synchronous)
+
+```{r}
+# Base model (random intercepts only)
+m.b2b.alpha.sync.00 <- load_or_fit(
+  model_name = "m.b2b.alpha.sync.00",
+  models_base_dir = models_base_dir,
+  modelSpec = "lmer(stdSqSyncMI ~ stdPIQ * ROI_pair + (1 | Dyad) + (1 | Dyad : Speaker) + (1 | electrode_pair), 
+                     data = alpha_df, REML = F)",
+  max_refit = 15)
+
+# add random slope
+m.b2b.alpha.sync.01 <- load_or_fit(
+  model_name = "m.b2b.alpha.sync.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(m.b2b.alpha.sync.00, . ~ . - (1 | Dyad : Speaker) + (1 + stdPIQ | Dyad : Speaker))",
+  max_refit = 15)
+
+
+anova(m.b2b.alpha.sync.01)
+
+# Model break down
+emtrends_alpha.sync.01 <- emtrends(m.b2b.alpha.sync.01, 
+                                   ~ ROI_pair, 
+                                   var = "stdPIQ",
+                                   pbkrtest.limit = 251370,
+                                   lmerTest.limit = 251370,
+                                   lmer.df = "satterthwaite"
+)
+
+summary(emtrends_alpha.sync.01,
+        adjust = "fdr",
+        infer = c(TRUE, TRUE),
+        level = 0.95)
+
+```
+
+#### Recurrent (Listener-lagging)
+
+```{r}
+# Base model (random intercepts only)
+m.b2b.alpha.rcrr.00 <- load_or_fit(
+  model_name = "m.b2b.alpha.rcrr.00",
+  models_base_dir = models_base_dir,
+  modelSpec = "lmer(stdSqRcrrMI ~ stdPIQ * ROI_pair + (1 | Dyad) + (1 | Dyad : Speaker) + (1 | electrode_pair), 
+                     data = alpha_df, REML = F)",
+  max_refit = 15)
+
+# add random slope
+m.b2b.alpha.rcrr.01 <- load_or_fit(
+  model_name = "m.b2b.alpha.rcrr.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(m.b2b.alpha.rcrr.00, . ~ . - (1 | Dyad : Speaker) + (1 + stdPIQ | Dyad : Speaker))",
+  max_refit = 15)
+
+anova(m.b2b.alpha.rcrr.01)
+
+# Model break down
+emtrends_alpha.rcrr.01 <- emtrends(m.b2b.alpha.rcrr.01, 
+                                   ~ ROI_pair, 
+                                   var = "stdPIQ",
+                                   pbkrtest.limit = 251370,
+                                   lmerTest.limit = 251370,
+                                   lmer.df = "satterthwaite"
+)
+
+summary(emtrends_alpha.rcrr.01,
+        adjust = "fdr",
+        infer = c(TRUE, TRUE),
+        level = 0.95)
+```
+
+### Theta band
+
+#### Concurrent (Synchronous)
+
+```{r}
+# Base model (random intercepts only)
+m.b2b.theta.sync.00 <- load_or_fit(
+  model_name = "m.b2b.theta.sync.00",
+  models_base_dir = models_base_dir,
+  modelSpec = "lmer(stdSqSyncMI ~ stdPIQ * ROI_pair + (1 | Dyad) + (1 | Dyad : Speaker) + (1 | electrode_pair), 
+                     data = theta_df, REML = F)",
+  max_refit = 15)
+
+# add random slope
+m.b2b.theta.sync.01 <- load_or_fit(
+  model_name = "m.b2b.theta.sync.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(m.b2b.theta.sync.00, . ~ . - (1 | Dyad : Speaker) + (1 + stdPIQ | Dyad : Speaker))",
+  max_refit = 15)
+
+anova(m.b2b.theta.sync.01)
+
+# Model break down
+emtrends_theta.sync.01 <- emtrends(m.b2b.theta.sync.01, 
+                                   ~ ROI_pair, 
+                                   var = "stdPIQ",
+                                   pbkrtest.limit = 251370,
+                                   lmerTest.limit = 251370,
+                                   lmer.df = "satterthwaite"
+)
+
+summary(emtrends_theta.sync.01,
+        adjust = "fdr",
+        infer = c(TRUE, TRUE),
+        level = 0.95)
+
+```
+
+#### Recurrent (Listener-lagging)
+
+```{r}
+# Base model (random intercepts only)
+m.b2b.theta.rcrr.00 <- load_or_fit(
+  model_name = "m.b2b.theta.rcrr.00",
+  models_base_dir = models_base_dir,
+  modelSpec = "lmer(stdSqRcrrMI ~ stdPIQ * ROI_pair + (1 | Dyad) + (1 | Dyad : Speaker) + (1 | electrode_pair), 
+                     data = theta_df, REML = F)",
+  max_refit = 15)
+
+# add random slope
+m.b2b.theta.rcrr.01 <- load_or_fit(
+  model_name = "m.b2b.theta.rcrr.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(m.b2b.theta.rcrr.00, . ~ . - (1 | Dyad : Speaker) + (1 + stdPIQ | Dyad : Speaker))",
+  max_refit = 15)
+
+anova(m.b2b.theta.rcrr.01)
+
+# Model break down
+emtrends_theta.rcrr.01 <- emtrends(m.b2b.theta.rcrr.01, 
+                                   ~ ROI_pair, 
+                                   var = "stdPIQ",
+                                   pbkrtest.limit = 251370,
+                                   lmerTest.limit = 251370,
+                                   lmer.df = "satterthwaite"
+)
+
+summary(emtrends_theta.rcrr.01,
+        adjust = "fdr",
+        infer = c(TRUE, TRUE),
+        level = 0.95)
+```
+
+
+## Put anova tables together
+```{r}
+anova_tables = list(
+  "Theta_synchrony" = anova(m.b2b.theta.sync.01) %>% as.data.frame() %>% rownames_to_column("Effect"),
+  "Theta_recurrence" = anova(m.b2b.theta.rcrr.01) %>% as.data.frame() %>% rownames_to_column("Effect"),
+  "Alpha_synchrony" = anova(m.b2b.alpha.sync.01) %>% as.data.frame() %>% rownames_to_column("Effect"),
+  "Alpha_recurrence" = anova(m.b2b.alpha.rcrr.01) %>% as.data.frame() %>% rownames_to_column("Effect")
+)
+```
+
+## Emtrends table
+```{r}
+emtrends_tables = list(
+  "Theta_synchrony" = summary(emtrends_theta.sync.01,
+                              adjust = "fdr",
+                              infer = c(T, T),
+                              level = 0.95) %>%
+    as.data.frame(),
+  "Theta_recurrence" = summary(emtrends_theta.rcrr.01,
+                               adjust = "fdr",
+                               infer = c(TRUE, TRUE),
+                               level = 0.95) %>%
+    as.data.frame(),
+  "Alpha_synchrony" = summary(emtrends_alpha.sync.01,
+                              adjust = "fdr",
+                              infer = c(TRUE, TRUE),
+                              level = 0.95) %>%
+    as.data.frame(),
+  "Alpha_recurrence" = summary(emtrends_alpha.rcrr.01,
+                               adjust = "fdr",
+                               infer = c(TRUE, TRUE),
+                               level = 0.95) %>%
+    as.data.frame()
+)
+
+# export emtrends_tables (excel file)
+library(writexl)
+write_xlsx(emtrends_tables, path = here("results", "emtrends_tables_updated.xlsx"))
+
+```
+
+## Viz
+```{r}
+library(tidyverse)
+library(concaveman)
+library(sf)
+library(smoothr)
+
+source(here("util", "draw_hyper_scalps_v4.R"))
+```
+
+
+```{r}
+## Alpha Sync data
+sync_sig <- emtrends_tables$Alpha_synchrony %>% 
+  separate(ROI_pair, sep = "_", into = c("from_ROI", "to_ROI")) %>% 
+  filter(p.value < 0.05)
+
+sync_from_ROI <- sync_sig %>% pull(from_ROI)
+sync_to_ROI <-   sync_sig %>% pull(to_ROI)
+sync_effect_values <- sync_sig %>% pull(t.ratio)
+
+# Alpha Recurrence data
+rcrr_sig <- emtrends_tables$Alpha_recurrence %>% 
+  separate(ROI_pair, sep = "_", into = c("from_ROI", "to_ROI")) %>% 
+  filter(p.value < 0.05)
+
+rcrr_from_ROI <- rcrr_sig %>% pull(from_ROI)
+rcrr_to_ROI <-   rcrr_sig %>% pull(to_ROI)
+rcrr_effect_values <- rcrr_sig %>% pull(t.ratio)
+
+min_val <- min(c(sync_effect_values, rcrr_effect_values))
+max_val <- max(c(sync_effect_values, rcrr_effect_values))
+
+# color_palette = c("#ffd78b","#ff733e", "#de300c")
+color_palette = c("#ffdb00","#ff9a00", "#de300c")
+
+# Alpha sync plot
+(p1 <- draw_hyper_plot(from_ROI = sync_from_ROI,
+                to_ROI = sync_to_ROI,
+                effect_values = sync_effect_values,
+                color_palette = color_palette,
+                basewidth = .5, 
+                col_min = min_val,
+                col_max = max_val))
+
+# Alpha recurrence plot
+(p2 <- draw_hyper_plot(from_ROI = rcrr_from_ROI,
+                to_ROI = rcrr_to_ROI,
+                effect_values = rcrr_effect_values,
+                color_palette = color_palette,
+                basewidth = .5, 
+                col_min = min_val,
+                col_max = max_val))
+
+```
+
+```{r}
+# figPath <- "../8_Dissemination/Figures/r_plots"
+
+# jpeg(file.path(figPath, 'hyper_scalps_alphasync_v2.jpg'),
+#      width = 8,
+#      height = 20,
+#      units = "cm",
+#      res = 600)
+# 
+# p1
+# 
+# dev.off()
+# 
+# jpeg(file.path(figPath, 'hyper_scalps_alpharcrr_v2.jpg'),
+#      width = 8,
+#      height = 20,
+#      units = "cm",
+#      res = 600)
+# 
+# p2
+# 
+# dev.off()
+```
+
+```{r}
+slopes_figure <- 
+  gcmi_tidy %>%
+  group_by(FrequencyBand, ROI_pair, Dyad, Speaker, Type, Block) %>%
+  summarise(stdPIQ = mean(stdPIQ),
+            stdSqSyncMI = mean(stdSqSyncMI)) %>%
+  filter(FrequencyBand == 'alpha',
+         ROI_pair %in% c("Right anterior_Medial anterior", "Right anterior_Right anterior", "Left anterior_Right anterior")) %>%
+  # rename levels in ROI_pair (- instead of _)
+  mutate(ROI_pair = gsub("_", "-", ROI_pair)) %>%
+  ggplot(aes(x = stdPIQ, y = stdSqSyncMI)) +
+  facet_wrap(~ ROI_pair, nrow=3) +
+  geom_point(alpha = 0.075, size = .5) +
+  geom_smooth(method = "lm",
+              se = F,
+              aes(group = interaction(Dyad, Speaker)),
+              color = "grey",
+              linewidth = .25,
+              alpha = .1,
+              fill = "transparent") +
+  coord_cartesian(ylim = c(-.6, 1)) +
+  
+  geom_smooth(method = "lm", 
+              se = TRUE, 
+              color = "#de300c", 
+              fill = "#de300c") +
+  papaja::theme_apa(base_family = "Helvetica") +
+  labs(x = "Perceived Interaction Quality (z)", y = "Alpha Synchrony GCMI (z)",
+       # title = "Alpha Band: Effect of PC1 on Speaker-Listener Synchrony GCMI"
+       ) +
+  theme(
+     strip.text = element_text(face = "bold"),
+     axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+  )
+   
+  
+slopes_figure
+
+# jpeg(file.path("Figures", "r_plots", 'inter_brain_alpha_slopes2.jpg'),
+#      width = 10,
+#      height = 20,
+#      units = "cm",
+#      res = 600)
+# 
+# slopes_figure
+# 
+# dev.off()
+```

@@ -1,0 +1,504 @@
+# Brain-to-Speech (Neural Speech Tracking) Analysis
+
+Libraries
+```{r}
+library(tidyverse)
+library(here)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(glmnet)
+library(caret)
+library(reshape2)
+library(purrr)
+library(rlang)
+library(broom)
+```
+
+```{r}
+source("functions/load_or_fit.R")
+
+# Options for scientific notation and decimal places
+options(scipen = 999, digits = 3)
+
+# Specify which packages to use for masked functions
+rescale <- arm::rescale
+lmer <- lmerTest::lmer
+select <- dplyr::select
+
+# Change optimizer parameter
+strict_tol <- lmerControl(optCtrl = list(xtol_abs = 1e-8, ftol_abs = 1e-8))
+
+# Set global options
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(dpi = 600)
+```
+
+```{r}
+theme_custom <- theme(
+  text = element_text(size = 12),
+  panel.grid = element_blank(),
+  panel.grid.major.y = element_line(colour = "#e3e1e1", linetype = 2),
+  plot.title.position = 'plot',
+  legend.position = 'top'
+)
+
+theme_set(theme_minimal() + theme_custom)
+
+figPath <- "../8_Dissemination/Figures/r_plots"
+```
+
+Define ROIs
+```{r}
+
+electrodes <- c(
+  "Fp1", "Fz", "F3", "F7", "FT9", "FC5", "FC1", "C3", "T7", "TP9", 
+  "CP5", "CP1", "Pz", "P3", "P7", "O1", "Oz", "O2", "P4", "P8", 
+  "TP10", "CP6", "CP2", "Cz", "C4", "T8", "FT10", "FC6", "FC2", 
+  "F4", "F8", "Fp2", "FCz"
+)
+
+
+roi_mapping <- list(
+  "left_anterior" = c("Fp1", "F3", "F7"),
+  "right_anterior" = c("Fp2", "F4", "F8"),
+  "medial_anterior" = c("Fz", "FC1", "FC2", "FCz"),
+  "medial_central" = c("C3", "Cz", "C4", "CP1", "CP2"),
+  "left_temporal" = c("FC5", "T7", "CP5"),
+  "right_temporal" = c("FC6", "T8", "CP6")
+)
+
+```
+
+### Load data
+```{r}
+convo_features <- readRDS(
+  here(
+    "data",
+    "4_conversation_features",
+    "convo_level_convo_features_with_bids.RDS"
+  )
+) %>%
+  mutate(Speaker = fct_recode(Speaker, A = "SpeakerA", B = "SpeakerB")) %>%
+  ungroup()
+```
+
+```{r}
+nst <- tibble()
+
+for (sub in c(4:14, 16:28)) {
+  
+  sub2 <- sprintf("%02d", sub) 
+    
+  df <- read_csv(paste0(
+    "../6_postprocessing/output/9a_NST/lagMI_NST_long_dyad_", sub2, ".csv"
+    ))
+  
+  nst <- rbind(nst, df)
+}
+```
+
+### Wrangle
+```{r}
+nst_tidy <- nst %>% 
+  mutate(across(Dyad:Condition, factor),
+         Label = electrodes[Channel],
+         Label = factor(Label),
+         Lag_sec = -Lag_sec,
+         Dyad = factor(str_replace(Dyad, "^D", "Dyad"))) %>%
+  select(-c(Channel, MI_raw, Lag_samples)) %>% 
+  rename(Channel = Label,
+         Type = Condition) %>% 
+  mutate(ROI = factor(case_when(
+    Channel %in% roi_mapping$left_anterior ~ "left_anterior",
+    Channel %in% roi_mapping$right_anterior ~ "right_anterior",
+    Channel %in% roi_mapping$medial_anterior ~ "medial_anterior",
+    Channel %in% roi_mapping$medial_central ~ "medial_central",
+    Channel %in% roi_mapping$left_temporal ~ "left_temporal",
+    Channel %in% roi_mapping$right_temporal ~ "right_temporal",
+    TRUE ~ NA
+  )))
+  
+
+nst_sub <- 
+  nst_tidy %>% 
+  filter(Lag_sec >= .05 & Lag_sec <= 0.3) %>% 
+  group_by(Dyad, Speaker, Type, Block, Channel, ROI) %>% 
+  summarise(MI = max(MI_norm)) %>% 
+  ungroup()
+```
+
+```{r}
+full_df <- nst_sub %>% 
+  left_join(convo_features) %>% 
+  filter(!is.na(ROI))
+
+# this df contains the Speaker's acoustics and speaker's MI
+```
+
+```{r}
+convo_features_pro <- 
+  convo_features %>%
+  mutate(Listener = recode(Speaker, A = "B", B = "A")) %>%
+  left_join(
+    convo_features %>%
+      select(Dyad, Speaker, Type, Block, 
+             listener_log_bid = log_bid, listener_PC1 = PC1),
+    by = c("Dyad", "Type", "Block", "Listener" = "Speaker")
+  ) %>%
+  rename(speaker_log_bid = log_bid) %>%
+  relocate(Listener, .after = Speaker) 
+
+# this df contains the Speaker's acoustic features, and the listener's PC1 (PIQ)
+```
+
+```{r}
+# here, isolate listener's involvement
+partner_trial <- full_df %>%
+  select(Dyad, Speaker, Type, Block, PC1, log_bid) %>%
+  distinct() %>%
+  rename(listener_PC1  = PC1,
+         listener_log_bid = log_bid) # contains speaker's PC1
+
+partner_mi <- full_df %>%
+  select(Dyad, Speaker, Type, Block, Channel, ROI, MI) %>%
+  rename(listener_MI = MI) # contains speaker's MI
+
+full_with_listener <- full_df %>%
+  mutate(Listener = recode(as.character(Speaker), A = "B", B = "A")) %>%
+  left_join(partner_trial,
+            by = c("Dyad", "Type", "Block", "Listener" = "Speaker")) %>%
+  left_join(partner_mi,
+            by = c("Dyad", "Type", "Block", "Channel", "ROI", "Listener" = "Speaker")) %>%
+  relocate(Listener, .after = Speaker) %>%
+  mutate(TrialID = factor(paste(Type, Block, sep = "_")),
+         TrialID2 = factor(paste(Type, Block, Dyad, sep = "_"))) %>%
+  mutate(across(f0_mean:speaking_rate, \(x) as.numeric(scale(x)))) %>%
+  mutate(listener_MI_sqrt = sqrt(listener_MI)) %>%
+  mutate(listener_MI_sqrt = as.numeric(scale(listener_MI_sqrt))) %>%
+  mutate(listener_MI = as.numeric(scale(listener_MI))) %>%
+  mutate(listener_PC1 = as.numeric(scale(listener_PC1))) %>%
+  ungroup()
+
+
+# saveRDS(full_with_listener, here("data", "8_nst_data", "nst_df.rds"))
+```
+
+## Elastic net approach for acoustic feature selection
+```{r}
+Xtmp <- full_with_listener %>% 
+  group_by(Dyad, Speaker, ROI) %>% 
+  mutate(across(f0_mean:speaking_rate, ~ as.numeric(scale(.x)))) %>% 
+  ungroup() %>% 
+  mutate(dyadid = paste(Dyad, Speaker, sep = "_")) %>% 
+  select(f0_mean, f0_sd, loudness, loud_sd, alpha_r, 
+         hnr, nturns, gap_s, speaking_rate, dyadid, listener_MI) %>%
+  filter(!if_any(everything(), is.na))
+
+tmpid <- Xtmp$dyadid
+tmpindex <- as.numeric(factor(tmpid))
+
+foldid <- tmpindex
+
+y <- as.numeric(scale(Xtmp$listener_MI))
+X <- Xtmp %>%
+  select(f0_mean, f0_sd, loudness, loud_sd, alpha_r, hnr, speaking_rate) %>%
+  as.matrix()
+
+X <- scale(X)
+
+res <- enet_select(
+  X = X, y = y, foldid = foldid,
+  alphas = seq(0.5, 1.0, 0.1),   # lean LASSO 
+  K_target = 5, K_range = c(1, 8),
+  nlambda = 500
+)
+
+# Inspect results
+res$alpha
+res$lambda
+res$nnz
+res$selected_terms
+res$coef_table %>% print(n = Inf)
+
+# outcome: Loudness SD, F0 SD, F0, and loudness
+```
+
+## Statistical model
+```{r}
+models_base_dir = here("models2")
+contrasts(full_with_listener$ROI) <- contr.sum(6)
+```
+
+```{r}
+# Base model (random intercepts only)
+
+mod.nst.00 <- load_or_fit(
+  model_name = "mod.nst.s.00",
+  models_base_dir = models_base_dir,
+  modelSpec = "lmer(listener_MI_sqrt ~ listener_PC1 * ROI + loud_sd + f0_mean + 
+               loudness + f0_sd + (1 | Dyad) + 
+               (1 | Dyad:Listener) + (1 | Channel), 
+             data = full_with_listener, REML = F)",
+  max_refit = 15)
+
+
+# std_PC1 as random slope
+mod.nst.01 <- load_or_fit(
+  model_name = "mod.nst.s.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(mod.nst.00, . ~ . - (1 | Dyad:Listener) + 
+                         (1 + listener_PC1 | Dyad:Listener))",
+  max_refit = 15)
+
+summary(mod.nst.01)
+anova(mod.nst.01)
+
+# Estimated marginal trends (EMTs)
+emtrends_mod.nst.01 <- emtrends(mod.nst.01, 
+                                   ~ ROI, 
+                                   var = "listener_PC1",
+                                   pbkrtest.limit = 14325,
+                                   lmerTest.limit = 14325,
+                                   lmer.df = "satterthwaite"
+)
+
+contrast(emtrends_mod.nst.01,
+        infer = TRUE)
+
+summary(emtrends_mod.nst.01,
+         adjust = "fdr",
+        infer = TRUE)
+```
+
+## Data Viz
+### Wave plot
+```{r}
+piq_median <- median(convo_features_pro$PC1, na.rm = T)
+
+tmp <- convo_features_pro %>% 
+  mutate(pctype = factor(ifelse(PC1 > piq_median, "high", "low"))) %>% 
+  select(Dyad, Speaker, Listener, Type, Block, PC1, pctype)
+
+toplot <- nst_tidy %>% 
+  left_join(tmp) %>% 
+  filter(!is.na(ROI)) %>% 
+  mutate(ROI2 = factor(ifelse(ROI == "medial_central", "medial_central", "other")))
+```
+
+```{r}
+col2 <- "#ee6055"
+col1 <- "#60d394"
+
+p1 <- toplot %>%
+  group_by(Dyad, Speaker, Type, Block, pctype, ROI, ROI2, Lag_sec) %>%
+  summarise(MI = mean(MI_norm),
+            PC1 = mean(PC1),
+            .groups = "drop") %>%
+  mutate(pctype = factor(pctype)) %>%
+  filter(Lag_sec > -0.1,!is.na(pctype)) %>%
+  mutate(pctype = fct_recode(pctype, High = "high", Low = "low")) %>%
+  filter(ROI2 == "medial_central") %>%
+  # rename(`Conversation Quality (PC1)` = pctype) %>%
+  ggplot(aes(
+    x = Lag_sec,
+    y = MI,
+    color = pctype,
+    fill = pctype
+  )) +
+  geom_vline(
+    xintercept = 0,
+    color = "black",
+    size = 1,
+    linetype = 2,
+    alpha = .5
+  ) +
+  annotate(
+    geom = 'rect',
+    xmin = 0,
+    xmax = 0.3,
+    ymin = -Inf,
+    ymax = Inf,
+    fill = 'gray90',
+    alpha = .5
+  ) +
+  stat_summary(fun = mean,
+               geom = "line",
+               aes(group = pctype),
+               size = 1) +
+  stat_summary(
+    fun.data = mean_se,
+    geom = "ribbon",
+    alpha = 0.6,
+    aes(fill = pctype),
+    size = 0
+  ) +
+  scale_fill_manual(values = c(col1, col2)) +
+  scale_color_manual(values = c(col1, col2)) +
+  # facet_grid(~ROI2) +
+  labs(x = "Lag (ms)",
+       y = "GCMI (bits)",
+       fill = "PIQ:  ",
+       color = "Conversational Enjoyment:  ") +
+  theme_custom +
+  theme(
+    text = element_text(size = 14, color = "black"),
+    # title = element_text(size = 21, color = dark1, face = "bold"),
+    axis.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_line(linetype = 2, colour = "#e3e1e1"),
+    axis.text = element_text(size = 12, family = "serif"),
+    # panel.background = element_rect(fill = white1),
+    # plot.background = element_rect(fill = light, color = NA, size = NA),
+    legend.position = "top",
+    legend.title = element_text(
+      size = 14,
+      face = "bold",
+      family = "serif"
+    ),
+    # legend.direction = "horizontal",
+    legend.text = element_text(size = 13)
+  )
+
+# # # SAVE
+# jpeg(file.path(figPath, 'nst_a_v1.jpg'),
+#      width = 21,
+#      height = 13,
+#      units = "cm",
+#      res = 600)
+# 
+# p1
+# 
+# dev.off()
+```
+
+### Scalp plot
+```{r}
+source("Analysis Scripts/create_nst_scalp_plot.R")
+
+chanLocs <- read_csv("supps/chanLocs.csv") %>%
+  rename(electrode = labels)
+
+chanLocs$radianTheta <- pi / 180 * chanLocs$theta
+
+chanLocs <- chanLocs %>%
+  mutate(x = .$radius * sin(.$radianTheta),
+         y = .$radius * cos(.$radianTheta)) %>%
+  dplyr::select(electrode, x, y)
+
+nst4scalp <- nst_tidy %>%
+  mutate(trialID = factor(paste(Dyad, Speaker, Type, Block, sep = "_")),
+         Channel = factor(Channel)) %>%
+  select(-ChannelLabel) %>%
+  rename(Lag = Lag_sec,
+         MI_value = MI_norm) %>%
+  left_join(chanLocs, by = join_by("Channel" == "electrode"))
+
+
+nstregressed <- nst4scalp %>%
+  mutate(MI_value = as.numeric(scale(MI_value))) %>%
+  left_join(tmp) %>%
+  mutate(PC1 = as.numeric(scale(PC1))) %>%
+  group_by(Channel, Lag) %>%
+  do(tidy(lm(MI_value ~ PC1, data = .))) %>%
+  filter(term == "PC1") %>%
+  rename(MI_value = statistic)
+nstregressed2 <- nstregressed %>%
+  left_join(chanLocs, by = join_by("Channel" == "electrode"))
+
+p_scalp <-
+  create_scalp(
+    nstregressed2,
+    0,
+    0.3,
+    min_val = -2,
+    max_val = 2,
+    legendt = "t stat"
+  )
+
+p_scalp2 <- p_scalp +
+  geom_point(
+    data = chanLocs %>% filter(electrode %in% c(roi_mapping$medial_central)),
+    aes(x = x, y = y),
+    size = 2,
+    fill = "black"
+  ) +
+  theme(
+    legend.position = "top",
+    legend.key.width = grid::unit(1, "cm"),
+    legend.key.height = grid::unit(.2, "cm"),
+    legend.text = element_text(family = "serif", size = 10),
+    legend.title = element_blank()
+  )
+
+
+# # # SAVE
+# jpeg(file.path(figPath, 'nst_scalp_v1.jpg'),
+#      width = 15,
+#      height = 15,
+#      units = "cm",
+#      res = 600)
+#
+# p_scalp2
+#
+# dev.off()
+```
+
+
+### LM plot
+```{r}
+full_with_listener %>%
+  group_by(Dyad, Listener, Type, Block, ROI, TrialID2) %>%
+  summarise(PC1 = mean(PC1), listener_MI = mean(listener_MI)) %>%
+  ggplot(aes(x = PC1, y = listener_MI)) +
+  geom_point(alpha = .2) +
+  geom_smooth(method = "lm") +
+  facet_wrap( ~ ROI)
+
+col1 <- "#43aa8b"
+#
+(
+  lm_plot <-
+    full_with_listener %>%
+    group_by(Dyad, Listener, Type, Block, ROI, TrialID2) %>%
+    summarise(
+      PC1 = mean(listener_PC1),
+      listener_MI = mean(listener_MI),
+      .groups = "drop"
+    ) %>%
+    filter(ROI == "medial_central") %>%
+    ggplot(aes(x = PC1, y = listener_MI)) +
+    geom_point(alpha = .2) +
+    geom_smooth(
+      method = "lm",
+      color = col1,
+      fill = col1,
+      alpha = 0.2,
+      size = 1.6
+    ) +
+    coord_cartesian(ylim = c(-1, 2.5)) +
+    labs(x = "Perceived Interaction Quality (z)",
+         y = "GCMI (z)") +
+    theme(
+      text = element_text(size = 14, color = "black"),
+      axis.title = element_text(
+        size = 14,
+        face = "bold",
+        family = "sans"
+      ),
+      axis.text = element_text(size = 12, family = "serif")
+    )
+)
+  
+
+# # SAVE
+# jpeg(file.path(figPath, 'nst_b_v2.jpg'),
+#      width = 21,
+#      height = 13,
+#      units = "cm",
+#      res = 600)
+# 
+# lm_plot
+# 
+# dev.off()
+```
