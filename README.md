@@ -11,5 +11,8 @@ The audio preprocessing pipeline also requires two manual steps: speaker diariza
 
 `03_Processing` contains the workflows to estimate the brain-to-speech (neural speech tracking) and brain-to-brain (inter-brain relationships) [gaussian copula mutual information (GCMI)](https://pmc.ncbi.nlm.nih.gov/articles/PMC5324576/) between interlocutors from the preprocessed data. Because these analyses are computationally intensive, they are implemented using the [Parallel Computing Toolbox](https://www.mathworks.com/products/parallel-computing.html). Note that all functions contained in the `util` subfolder must be added to the MATLAB path before running the processing scripts.
 
-`04_Analysis` contains the code (in R and R Markdown) used for data wrangling, visualization, and statistical analysis with [lme4](https://cran.r-project.org/web/packages/lme4/lme4.pdf). 
+`04_Analysis` contains the code (in R and R Markdown) used for data wrangling, visualization, and statistical analysis with [lme4](https://cran.r-project.org/web/packages/lme4/lme4.pdf).
+
+Note that most scripts in this repository include a header describing their purpose and functionality.
+
 
