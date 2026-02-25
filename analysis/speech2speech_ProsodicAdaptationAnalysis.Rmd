@@ -1,0 +1,874 @@
+# Speech-to-Speech (Prosodic Adaptation) Analysis
+
+## Prep
+
+### Libraries
+```{r}
+library(tidyverse)
+library(forcats)
+library(scales)
+library(here)
+library(gridExtra)
+library(factoextra)
+library(emmeans)
+library(lme4)
+library(lmerTest)
+```
+
+### Helpers
+```{r}
+source("util/load_or_fit.R")
+models_base_dir = here("models")
+figPath <- "../8_Dissemination/Figures/r_plots"
+
+options(scipen = 999, digits = 3)
+
+rescale <- arm::rescale
+lmer <- lmerTest::lmer
+select <- dplyr::select
+
+strict_tol <- lmerControl(optCtrl = list(xtol_abs = 1e-8, ftol_abs = 1e-8))
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(dpi = 600)
+```
+
+### Load data
+```{r}
+partner_raw  <-
+  read_csv(here("data", "1_behavioral_data", "partner_questionnaire.csv"))
+
+acoustic_raw <-
+  readRDS(here(
+    "data",
+    "4_conversation_features",
+    "turn_level_convo_features.RDS"
+  ))
+
+convo_raw <-
+  readRDS(here("data", "1_behavioral_data", "conversation_scores_tidy.RDS"))
+```
+
+#### Wrangle partner data
+```{r}
+partner_tidy <-
+  partner_raw %>%
+  rename_with(~ str_remove_all(., "^partner_"),
+              partner_approachable:partner_trustworthy) %>%
+  select(-c(block_id, run_id, person_id))  %>%
+  mutate(group = str_replace_all(group, "^D", "Dyad")) %>%
+  rename(Dyad = group, Listener = id) %>%
+  mutate(across(Dyad:Listener, factor)) %>%
+  select(Dyad, Listener, everything())
+```
+
+#### Wrangle acoustic data
+```{r}
+acoustic_tidy <-
+  acoustic_raw %>%
+  mutate(Speaker = fct_recode(Speaker, A = "SpeakerA", B = "SpeakerB")) %>%
+  mutate(Listener = recode(Speaker, A = "B", B = "A")) %>%
+  relocate(Listener, .after = Speaker) 
+```
+
+#### Wrangle conversational engagement data
+```{r}
+convo_tidy <- convo_raw %>%
+  rename(
+    Dyad = dyad,
+    Type = interest,
+    Listener = id,
+    Block = block,
+    Topic2 = conv_topic_clean
+  ) %>%
+  mutate(
+    Dyad = factor(str_replace(Dyad, "^D", "Dyad")),
+    Type = factor(ifelse(
+      Type == "low", "LowInterest", "HighInterest"
+    )),
+    log_bid = pmax(log_bid, 0)
+  ) %>%
+  group_by(Dyad, Listener) %>%
+  mutate(sbid = as.numeric(scale(log_bid))) %>%
+  ungroup() %>%
+  select(-person_id)
+
+# some fixing needed:
+convo_tidy$Type[is.na(convo_tidy$Type)] = "HighInterest"
+convo_tidy$Block[is.na(convo_tidy$Block)] = 6
+```
+
+## Extract partner perception latent structure
+
+We collected ratings across multiple scales related to person perception (e.g., approachability, competence, attractiveness, etc.) from each participant at the end of each experiment session. Let's first reduce dimensionality.
+
+```{r}
+ratings <- partner_tidy %>% select(approachable:trustworthy)
+pca_res <- prcomp(ratings, scale. = TRUE)
+
+p1 <- fviz_eig(pca_res, addlabels = TRUE) # scree plot
+p2 <- fviz_pca_var(pca_res,
+             col.var = "contrib", 
+             gradient.cols = c("lightblue", "orange", "red"),
+             repel = TRUE)
+
+grid.arrange(p1, p2, ncol=2) # show
+
+# add scores to df
+pca_scores <- as.data.frame(pca_res$x)
+
+partner_pca <- partner_tidy %>%
+  mutate(social_positivity = pca_scores$PC1) %>% 
+  select(Dyad, Listener, social_positivity,everything())
+
+# join with acoustic data
+parcoustic_df <- acoustic_tidy %>% 
+  left_join(partner_pca)
+
+# saveRDS(partner_pca, here("data", "1_behavioral_data", "partner_scores_with_PC.RDS"))
+```
+
+Most interpersonal impression variability is captured by a single main factor of social positivity, approach-avoid response, or *mutual affinity*. This will effectively serve as a composite continuous index summarizing these correlated judgments.
+
+## 1. Session-level convergence
+
+Do conversation partners speak more similarly at the end, compared to the start, of the experiment? Is this modulated by their social perception of each other?
+
+```{r}
+acoustics_by_speaker <- parcoustic_df %>%
+  group_by(Dyad, Type, Block, Speaker) %>%
+  summarise(across(c(f0_mean, loudness, VoicedSegmentsPerSec, hnr), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = Speaker,
+    values_from = c(f0_mean, loudness, VoicedSegmentsPerSec, hnr),
+    names_glue  = "{.value}_{Speaker}"   # columns like f0_mean_A, f0_mean_B, etc.
+  )
+
+social_avg <- parcoustic_df %>%
+  group_by(Dyad) %>%
+  summarise(social_positivity = mean(social_positivity, na.rm = TRUE),
+            .groups = "drop")
+
+parcoustics_wide <- acoustics_by_speaker %>%
+  left_join(social_avg, by = c("Dyad")) %>%
+  mutate(
+    f0_diff       = abs(f0_mean_B - f0_mean_A),
+    loudness_diff = abs(loudness_B - loudness_A),
+    VoicedSegmentsPerSec_diff   = abs(VoicedSegmentsPerSec_B - VoicedSegmentsPerSec_A),
+    hnr_diff  = abs(hnr_B - hnr_A)
+  ) %>%
+  select(Dyad,
+         Type,
+         Block,
+         social_positivity,
+         f0_diff,
+         loudness_diff,
+         VoicedSegmentsPerSec_diff,
+         hnr_diff)
+
+
+convergence_df <- parcoustics_wide %>%
+  group_by(Dyad) %>%
+  mutate(across(f0_diff:hnr_diff, \(x) as.numeric(scale(x)))) %>%
+  ungroup() %>%
+  filter(Block %in% c(1, 2, 5, 6)) %>%
+  mutate(Block = factor(ifelse(Block %in% c(1, 2), "Early", "Late"))) %>%
+  group_by(Dyad, Type, Block, social_positivity) %>%
+  summarise(
+    f0_diff = mean(f0_diff),
+    loudness_diff = mean(loudness_diff),
+    VoicedSegmentsPerSec_diff = mean(VoicedSegmentsPerSec_diff),
+    hnr_diff = mean(hnr_diff),
+    .groups = "drop"
+  )
+
+further_convergence <- convergence_df %>%
+  group_by(Dyad, Type) %>%
+  pivot_wider(values_from = c(f0_diff:hnr_diff),
+              names_from = Block) %>%
+  mutate(
+    f0_diff = f0_diff_Late - f0_diff_Early,
+    loudness_diff = loudness_diff_Late - loudness_diff_Early,
+    VoicedSegmentsPerSec_diff = VoicedSegmentsPerSec_diff_Late - VoicedSegmentsPerSec_diff_Early,
+    hnr_diff = hnr_diff_Late - hnr_diff_Early
+  ) %>%
+  select(Dyad,
+         Type,
+         social_positivity,
+         f0_diff,
+         loudness_diff,
+         VoicedSegmentsPerSec_diff,
+         hnr_diff)
+
+convergence_long <- convergence_df %>%
+  pivot_longer(f0_diff:hnr_diff, names_to = "feature", values_to = "diff") %>%
+  mutate(feature = factor(feature))
+```
+
+### Model fit
+```{r}
+contrasts(convergence_long$Block) <- contr.helmert(2)/2
+contrasts(convergence_long$feature) <- contr.sum(4)
+
+# Base model (random intercepts only)
+mod.seshconv.00 <- load_or_fit(
+  model_name = "mod.seshconv.00",
+  models_base_dir = models_base_dir,
+  modelSpec = 
+    "lmer(diff ~ Block * social_positivity * feature + (1 | Dyad), 
+      data = convergence_long, REML = F)",
+  max_refit = 10)
+
+# std_PC1 as random slope
+mod.seshconv.01 <- load_or_fit(
+  model_name = "mod.seshconv.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(mod.seshconv.00, . ~ . - (1 | Dyad) + 
+                  (1 + Block * social_positivity | Dyad))",
+  max_refit = 10)
+
+anova(mod.seshconv.01)
+```
+
+#### Estimated Marginal Means:
+```{r}
+emm_block_feat <- emmeans(mod.seshconv.01, ~ Block | feature)
+(pairs_block_feat <- pairs(emm_block_feat))
+
+# While non of the features shows convergence overall...
+
+emm_slopes <- emtrends(mod.seshconv.01, ~ feature * Block, var = "social_positivity")
+(emm_slopes2 <- pairs(emm_slopes, by = "feature"))
+
+# The slope of social positivity on loudness and HNR differences is larger (more positive) in Early than in Late blocks.
+
+# Conceptually, high-positivity dyads close the loudness and HNR gap more over time, showing greater convergence. In other words, the change in this slope signifies that social positivity facilitates prosodic convergence over time specifically for loudness and HNR.
+```
+
+### Viz:
+```{r}
+# Palette (Vibrant hues: https://coolors.co/palette/f94144-f3722c-f8961e-f9844a-f9c74f-90be6d-43aa8b-4d908e-577590-277da1)
+
+bold_cols <- c(
+  "Loudness" = "#f94144",
+  "F0" = "#277da1",
+  "Voicing Rate" = "#43aa8b",
+  "HNR" = "#f9844a"
+)
+
+
+p <- further_convergence %>%
+  ungroup() %>%
+  pivot_longer(f0_diff:hnr_diff, values_to = "diff", names_to = "feature") %>%
+  filter(!is.na(social_positivity)) %>%
+  mutate(
+    feature = fct_recode(
+      feature,
+      Loudness = "loudness_diff",
+      F0 = "f0_diff",
+      `Voicing Rate` = "VoicedSegmentsPerSec_diff",
+      `HNR` = "hnr_diff"
+    ),
+    feature = fct_relevel(feature, "F0", "HNR", "Loudness", "Voicing Rate")
+  ) %>%
+  ggplot(aes(x = social_positivity, y = diff, color = feature)) +
+  geom_point(
+    alpha = 0.6,
+    size = 1.8,
+    position = position_jitter(width = 0.02, height = 0)
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 1.1,
+    span = 0.9
+  ) +
+  scale_color_manual(values = bold_cols, guide = "none") +
+  labs(
+    x = "Mutual affinity score",
+    y = "Distance over time (z)") +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  coord_cartesian(expand = FALSE) +
+  theme_minimal(base_size = 10, base_family = "sans") +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.major.y = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 6), face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 6), face = "bold"),
+    axis.text = element_text(color = "grey15", family = "serif"),
+    plot.margin = margin(10, 10, 10, 10),
+    panel.spacing = unit(1.8, "cm")
+  )
+
+p
+
+
+# jpeg(file.path(figPath, 'session_convergence_v1.jpg'),
+#      width = 36,
+#      height = 6.5,
+#      units = "cm",
+#      res = 600)
+#
+# p
+#
+# dev.off()
+```
+
+
+## 2. Conversation-level convergence  
+
+At the conversation level, we were interested in finding out whether conversation partners spoke more similarly at the end (vs the beginning) of each conversation, particularly when they felt involved/engaged in it.
+
+```{r}
+cacoustics <-
+  acoustic_tidy %>%
+  left_join(convo_tidy) %>%
+  mutate(across(start:end, \(x) x / 44100), # turn into seconds
+         Timing = factor(case_when(
+           end <= 80 ~ "Early", end >= 160 ~ "Late", TRUE ~ "Middle"
+         )))
+
+remove_these <- cacoustics %>%
+  group_by(Dyad, Speaker, Type, Block, Timing) %>%
+  count() %>%
+  filter(Timing %in% c("Early", "Late"), n == 1)
+
+cacoustics_clean <- cacoustics %>%
+  anti_join(remove_these %>% select(-n),
+            by = c("Dyad", "Speaker", "Type", "Block")) %>%
+  # filter(Timing != "Middle") %>%
+  group_by(Dyad, Speaker, Listener, Type, Block, Timing, engagement_PC1) %>%
+  summarise(across(
+    c(f0_mean, loudness, VoicedSegmentsPerSec, hnr),
+    \(x) mean(x, na.rm = TRUE)
+  ), .groups = "drop") %>%
+  mutate(Timing = factor(Timing, levels = c("Early", "Middle", "Late")))
+
+```
+
+```{r}
+cacoustics_temp <-
+  cacoustics_clean %>%
+  group_by(Dyad, Speaker) %>%
+  mutate(across(f0_mean:hnr, \(x) as.numeric(scale(x)))) %>%
+  ungroup() %>%
+  pivot_longer(f0_mean:hnr, names_to = "feature", values_to = "value") %>%
+  select(-Listener) 
+
+cacoustics_diff <-
+  cacoustics_temp %>%
+  pivot_wider(
+    names_from  = Speaker,
+    values_from = c(value, engagement_PC1),
+    names_glue  = "{.value}_{Speaker}"
+  ) %>%
+  mutate(
+    diff = abs(value_B - value_A),
+    engagement = ((engagement_PC1_A + engagement_PC1_B) / 2),
+    feature = factor(feature)
+  )
+
+cacoustics_diff_ultra <-
+  cacoustics_diff %>%
+  filter(Timing != "Middle") %>%
+  select(-c(value_A, value_B, engagement_PC1_A, engagement_PC1_B)) %>%
+  pivot_wider(names_from = Timing, values_from = diff) %>%
+  mutate(diff_diff = Late - Early) 
+
+# model-ready
+cacoustics_test <- cacoustics_diff %>% filter(Timing != "Middle") %>% droplevels()
+```
+
+Adding sex information
+```{r}
+male_dyads <- c("Dyad10", "Dyad12", "Dyad13", "Dyad14", "Dyad18", "Dyad12", "Dyad21",
+                "Dyad22", "Dyad23", "Dyad24", "Dyad25", "Dyad26")
+
+cacoustics_test <- cacoustics_test %>% 
+  mutate(gender = factor(ifelse(Dyad %in% male_dyads, "male", "female")))
+```
+
+### Model fit
+
+```{r}
+contrasts(cacoustics_test$Timing) <- contr.helmert(2)/2
+contrasts(cacoustics_test$feature) <- contr.sum(4)
+
+# Base model (random intercepts only)
+mod.convoconv.00 <- load_or_fit(
+  model_name = "mod.convoconv.00",
+  models_base_dir = models_base_dir,
+  modelSpec = 
+    "lmer(diff ~ Timing * engagement * feature + (1 | Dyad), 
+      data = cacoustics_test, REML = F)",
+  max_refit = 10)
+
+# std_PC1 as random slope
+mod.convoconv.01 <- load_or_fit(
+  model_name = "mod.convoconv.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(mod.convoconv.00, . ~ . - (1 | Dyad) + 
+                  (1 + Timing * engagement | Dyad))",
+  max_refit = 10)
+
+anova(mod.convoconv.01)
+
+# credible main effect of Timing, indicating that, on average, acoustic differences between dyad members decreased from early to late conversation segments.This suggests a general tendency for convergence over time.
+```
+
+```{r}
+emm_timing_feat <- emmeans(mod.convoconv.01, ~ Timing | feature)
+(pairs_timing_feat <- pairs(emm_timing_feat))
+
+# This shows that convergence happened specifically for F0 and voicing rate.
+
+emm_slopes <- emtrends(mod.convoconv.01, ~ feature * Timing, var = "engagement")
+(emm_slopes2 <- pairs(emm_slopes, by = "feature"))
+```
+
+### Viz:
+```{r}
+p2 <- cacoustics_clean %>%
+  group_by(Dyad, Speaker) %>%
+  mutate(across(f0_mean:hnr, \(x) as.numeric(scale(x)))) %>%
+  ungroup() %>%
+  pivot_longer(f0_mean:hnr, names_to = "feature", values_to = "value") %>%
+  mutate(
+    feature = fct_recode(
+      feature,
+      Loudness = "loudness",
+      F0 = "f0_mean",
+      `Voicing Rate` = "VoicedSegmentsPerSec",
+      `HNR` = "hnr"
+    ),
+    feature = fct_relevel(feature, "F0", "HNR", "Loudness", "Voicing Rate")
+  ) %>%
+  ggplot(aes(x = Timing, y = value, color = feature)) +
+  # Mean ± SE with slight dodge for clarity
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 2.6,
+    position = position_dodge(width = 0.18)
+  ) +
+  stat_summary(
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.15,
+    linewidth = 0.9,
+    position = position_dodge(width = 0.18)
+  ) +
+  scale_color_manual(values = bold_cols, guide = "none") +
+  labs(
+    title = "How do people change their vocal expression throughout a conversation?",
+    subtitle = "Mean standardized feature values (z) across conversation timing",
+    x = "Moment in conversation",
+    y = "Standardized value (z)"
+  ) +
+  facet_wrap( ~ feature, scales = "free_y", ncol = 2) +
+  coord_cartesian(expand = FALSE) +
+  theme_minimal(base_size = 12, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 14,
+      margin = margin(b = 4)
+    ),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 8)),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.x = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.major.y = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 6)),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    axis.text = element_text(color = "grey15"),
+    plot.margin = margin(10, 10, 10, 10),
+    panel.spacing = unit(10, "pt")
+  )
+
+p2
+
+
+p3 <- cacoustics_diff %>%
+  mutate(
+    feature = fct_recode(
+      feature,
+      Loudness = "loudness",
+      F0 = "f0_mean",
+      `Voicing Rate` = "VoicedSegmentsPerSec",
+      `HNR` = "hnr"
+    ),
+    feature = fct_relevel(feature, "F0", "HNR", "Loudness", "Voicing Rate")
+  ) %>%
+  ggplot(aes(x = Timing, y = diff, color = feature)) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 2.6#,
+    # position = position_dodge(width = 0.18)
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "line",
+    aes(group = 1),
+    linewidth = 0.9,
+    linetype = 5
+  ) +
+  stat_summary(
+    fun.data = mean_se,
+    geom = "errorbar",
+    width = 0.11,
+    linewidth = 0.9,
+    position = position_dodge(width = 0.18)
+  ) +
+  scale_color_manual(values = bold_cols, guide = "none") +
+  labs(
+    x = "Moment in conversation",
+    y = "Within-dyad difference (z)"
+  ) +
+  facet_wrap( ~ feature, ncol = 4) +
+  coord_cartesian(expand = FALSE) +
+  theme_minimal(base_size = 10, base_family = "sans") +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 6), face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 6), face = "bold"),
+    axis.text.x = element_text(color = "grey15", family = "sans"),
+    axis.text.y = element_text(color = "grey15", family = "serif"),
+    plot.margin = margin(10, 10, 10, 10),
+    panel.spacing = unit(1.8, "cm")
+  )
+
+p3
+
+
+# jpeg(file.path(figPath, 'convo_convergence_v1.jpg'),
+#      width = 36,
+#      height = 7.3,
+#      units = "cm",
+#      res = 600)
+# 
+# p3
+# 
+# dev.off()
+```
+
+
+## 3. Conversation-level synchrony
+
+Finally, we were interested in whether conversation partners modulated their voices in a similar manner (i.e., they synchronized their vocal expression) and whether this was influenced by their conversational involvement.
+
+```{r}
+cacoustics_ordered <-
+  cacoustics %>%
+  select(
+    Dyad,
+    Speaker,
+    Listener,
+    Type,
+    Block,
+    TurnNum,
+    start,
+    f0_mean,
+    loudness,
+    VoicedSegmentsPerSec,
+    hnr,
+    duration,
+    engagement_PC1,
+    text,
+    end
+  ) %>%
+  arrange(Dyad, Type, Block, TurnNum, start)
+
+
+cacoustics_collapsed <- cacoustics_ordered %>%
+  group_by(Dyad, Type, Block) %>%
+  mutate(speaker_run = cumsum(Speaker != lag(Speaker, default = first(Speaker)))) %>%
+  group_by(Dyad,
+           Type,
+           Block,
+           speaker_run,
+           Speaker,
+           Listener,
+           engagement_PC1) %>%
+  summarise(
+    TurnStart = min(start, na.rm = TRUE),
+    TurnEnd = max(end, na.rm = TRUE),
+    f0_mean = mean(f0_mean, na.rm = TRUE),
+    loudness = mean(loudness, na.rm = TRUE),
+    VoicedSegmentsPerSec = mean(VoicedSegmentsPerSec, na.rm = TRUE),
+    hnr = mean(hnr, na.rm = TRUE),
+    text = paste(text, collapse = " "),
+    .groups = "drop"
+  ) %>%
+  group_by(Dyad, Type, Block, Speaker) %>%
+  mutate(TurnNum = row_number()) %>%
+  ungroup()
+
+
+cacoustics_sync <- cacoustics_collapsed %>%
+  group_by(Dyad, Type, Block) %>%
+  mutate(
+    partner_f0_prev = lag(f0_mean),
+    partner_loud_prev = lag(loudness),
+    partner_VoicedSegmentsPerSec_prev = lag(VoicedSegmentsPerSec),
+    partner_hnr_prev = lag(hnr)
+  ) %>%
+  filter(!is.na(partner_f0_prev))
+
+cacoustics_long <- cacoustics_sync %>%
+  pivot_longer(
+    cols = c(f0_mean, loudness, VoicedSegmentsPerSec, hnr),
+    names_to = "feature",
+    values_to = "value"
+  ) %>%
+  pivot_longer(
+    cols = c(
+      partner_f0_prev,
+      partner_loud_prev,
+      partner_VoicedSegmentsPerSec_prev,
+      partner_hnr_prev
+    ),
+    names_to = "partner_feature",
+    values_to = "partner_value"
+  ) %>%
+  # Keep only matching pairs
+  filter(
+    (feature == "f0_mean" & partner_feature == "partner_f0_prev") |
+      (feature == "loudness" &
+         partner_feature == "partner_loud_prev") |
+      (
+        feature == "VoicedSegmentsPerSec" &
+          partner_feature == "partner_VoicedSegmentsPerSec_prev"
+      ) |
+      (feature == "hnr" & partner_feature == "partner_hnr_prev")
+  ) %>%
+  select(-partner_feature) %>%
+  mutate(feature = factor(feature)) %>%
+  group_by(Dyad, Speaker, feature) %>%
+  mutate(value = as.numeric(scale(value)), partner_value = as.numeric(scale(partner_value)))
+```
+
+Add sex info:
+```{r}
+cacoustics_long <- cacoustics_long %>% 
+  mutate(gender = factor(ifelse(Dyad %in% male_dyads, "male", "female")))
+```
+
+### Model fit
+```{r}
+contrasts(cacoustics_long$feature) <- contr.sum(4)
+
+# Base model (random intercepts only)
+mod.convosync.00 <- load_or_fit(
+  model_name = "mod.convosync.00",
+  models_base_dir = models_base_dir,
+  modelSpec = 
+    "lmer(value ~ partner_value * engagement_PC1 * feature + (1 | Dyad/Speaker), 
+      data = cacoustics_long, REML = F)",
+  max_refit = 10)
+
+# std_PC1 as random slope
+mod.convosync.01 <- load_or_fit(
+  model_name = "mod.convosync.01",
+  models_base_dir = models_base_dir,
+  modelSpec = "update(mod.convosync.00, . ~ . - (1 | Dyad/Speaker) + 
+                  (1 + partner_value * engagement_PC1 | Dyad/Speaker))",
+  max_refit = 10)
+
+anova(mod.convosync.01)
+
+# strong evidence of prosodic synchrony across dyads: when one partner modulates a prosodic feature, the other tends to follow in the next turn.
+
+# Synchrony strength depends on the feature: not all prosodic dimensions align equally.
+
+# Engagement affects overall expressivity, but it doesn’t significantly enhance or suppress synchrony strength.
+```
+
+Estimated marginal means:
+```{r}
+emm_sync <- emtrends(mod.convosync.01, ~feature, var = "partner_value",
+  pbkrtest.limit = 20480,
+  lmerTest.limit = 20480,
+  lmer.df = "satterthwaite"
+)
+
+summary(emm_sync, infer=TRUE)
+
+# There's synchrony across all features except voicing rate
+
+
+# emm_sync_levels <- emtrends(
+#   mod.convosync.01,
+#   ~ feature | engagement_PC1,
+#   var = "partner_value",
+#   at = list(engagement_PC1 = c(-1.5, 1.5)),
+#   pbkrtest.limit = 20480,
+#   lmerTest.limit = 20480,
+#   lmer.df = "satterthwaite"
+# )
+# 
+# pairs(emm_sync_levels, by = "feature")
+```
+
+### Viz:
+```{r}
+speaker_cols <- c(
+  "A" = "#1E88E5",  # blue
+  "B" = "#D81B60"   # raspberry
+)
+
+p4 <- cacoustics_sync %>%
+  filter(Dyad == "Dyad18") %>%
+  ggplot(aes(
+    x = TurnNum,
+    y = VoicedSegmentsPerSec,
+    color = Speaker,
+    group = Speaker
+  )) +
+  geom_line(linewidth = 0.9, alpha = 0.9) +
+  geom_point(size = 1.4, alpha = 0.75) +
+  scale_color_manual(values = speaker_cols, guide = "none") +
+  labs(
+    title = "Within-dyad voicing rate trajectories by turn",
+    subtitle = "Dyad 18, separated by block and conversation type",
+    x = "Turn number",
+    y = "Voicing Rate (z)"
+  ) +
+  facet_grid(Block ~ Type, scales = "free_y") +
+  coord_cartesian(expand = FALSE) +
+  theme_minimal(base_size = 12, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 8)),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.x = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.major.y = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 6)),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    axis.text = element_text(color = "grey15"),
+    plot.margin = margin(10, 10, 10, 10),
+    panel.spacing.x = unit(10, "pt"),
+    panel.spacing.y = unit(10, "pt")
+  )
+
+p4
+
+p5 <- cacoustics_sync %>%
+  filter(Dyad == "Dyad26") %>%
+  ggplot(aes(
+    x = TurnNum,
+    y = loudness,
+    color = Speaker,
+    group = Speaker
+  )) +
+  geom_line(linewidth = 0.9, alpha = 0.9) +
+  geom_point(size = 1.4, alpha = 0.75) +
+  scale_color_manual(values = speaker_cols, guide = "none") +
+  labs(
+    title = "Within-dyad loudness trajectories by turn",
+    subtitle = "Dyad 26, separated by block and conversation type",
+    x = "Turn number",
+    y = "Loudness (z)"
+  ) +
+  facet_grid(Block ~ Type, scales = "free_y") +
+  coord_cartesian(expand = FALSE) +
+  theme_minimal(base_size = 12, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 8)),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.x = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.major.y = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 6)),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    axis.text = element_text(color = "grey15"),
+    plot.margin = margin(10, 10, 10, 10),
+    panel.spacing.x = unit(10, "pt"),
+    panel.spacing.y = unit(10, "pt")
+  )
+
+p5
+```
+
+## Exploratory analysis of vocal expression.
+
+How did people express themselves when they were involved in the conversation?
+
+```{r}
+engagement_cols <- c(
+  "High"  = "#004D40",
+  "Low" = "#D81B60"
+)
+
+feature_levels <- c("f0_sd","gap_s","loud_sd","f0_mean","hnr","loudness","VoicedSegmentsPerSec")
+feature_labels <- c(
+  f0_sd = "F0 SD",
+  gap_s = "Gap",
+  loud_sd = "Loudness SD",
+  f0_mean = "F0",
+  hnr = "HNR",
+  loudness = "Loudness",
+  VoicedSegmentsPerSec = "Voicing rate"
+)
+
+medianOfEngagement <- median(cacoustics$engagement_PC1, na.rm = TRUE)
+
+maledyads <- c("Dyad10","Dyad12","Dyad13","Dyad14","Dyad18",
+               "Dyad21","Dyad22","Dyad23","Dyad24","Dyad25","Dyad26")
+
+cacoustics_web <- cacoustics %>% 
+  mutate(engagement_level = ifelse(engagement_PC1 >= medianOfEngagement, "High", "Low")) %>% 
+  select(Dyad, Speaker, Type, Block, TurnNum, f0_mean, f0_sd, loudness, loud_sd,
+         hnr, gap_s, VoicedSegmentsPerSec, engagement_level) %>% 
+  mutate(across(f0_mean:VoicedSegmentsPerSec, \(x) as.numeric(scale(x)))) %>% 
+  pivot_longer(f0_mean:VoicedSegmentsPerSec, names_to = "feature", values_to = "value") %>% 
+  filter(!is.na(value), !is.na(engagement_level)) %>% 
+  mutate(
+    feature = factor(feature, levels = feature_levels, labels = feature_labels),
+    engagement_level = factor(engagement_level, levels = c("Low","High")),
+    Gender = factor(ifelse(Dyad %in% maledyads, "male", "female"))
+  )
+
+(p5 <- cacoustics_web %>% 
+  group_by(Dyad, Speaker, Type, Block, feature, engagement_level, Gender) %>% 
+  summarise(value = mean(value), .groups = "drop") %>% 
+  ggplot(aes(x = feature, y = value, color = engagement_level, fill = engagement_level, group = engagement_level)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.25, size = 0) +
+  stat_summary(fun = mean, geom = "line", linewidth = 0.9) +
+  stat_summary(fun = mean, geom = "point", size = 2.1, stroke = 0.2, shape = 21) +
+  scale_color_manual(values = engagement_cols, guide = "none") +
+  scale_fill_manual(values = engagement_cols, name = "Involvement") +
+  labs(
+    title = "Acoustic profile by conversational involvement",
+    subtitle = "Mean standardized values (z) across features; ribbons show SE",
+    x = "Acoustic Feature",
+    y = "Value (z)"
+  ) +
+  facet_grid(. ~ Gender) +
+  coord_polar() +
+  theme_minimal(base_size = 12, base_family = "sans") +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 11, margin = margin(b = 8)),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major = element_line(color = alpha("grey60", 0.25), linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 6)),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    axis.text = element_text(color = "grey15"),
+    plot.margin = margin(10, 10, 10, 10),
+    legend.position = "top",
+    panel.spacing = unit(10, "pt")
+  ))
+
+p5
+
+```
