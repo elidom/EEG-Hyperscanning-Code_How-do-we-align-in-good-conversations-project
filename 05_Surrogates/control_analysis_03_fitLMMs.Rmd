@@ -1,0 +1,278 @@
+# **CONTROL ANALYSIS — Fit Surrogate Models**
+
+**Author:** Marcos E. Domínguez Arriola
+**Repository:** https://github.com/elidom/EEG-Hyperscanning-Code_How-do-we-align-in-good-conversations-project
+
+**Project:** Domínguez-Arriola, Lam, Pérez, & Pell (under review)
+How Do We Align in Good Conversation?
+
+Fits Linear Mixed-Effects Models to surrogate (shuffled-dyad) neural datasets to construct permutation-based null distributions for the relationship between perceived interaction quality (PIQ) and inter-brain relationships.
+
+**Notes:**
+- The user must manually specify:
+  * frequency band (`alpha` or `theta`)
+  * temporal dependency (`concurrent` or `recurrent`)
+
+
+Libraries:
+```{r}
+library(tidyverse)
+library(patchwork)
+library(here)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+```
+
+Parameters
+```{r}
+freqband    <- "alpha"
+temp_dep    <- "recurrent"
+srr_samples <- 1:200
+
+# optional verbose:
+show_Fs <-
+  FALSE # whether to print resulting PIQ mainf effects (F statistic) on each loop iteration
+
+which_rois_to_print <-
+  "right_temporal-medial_anterior" # which ROI pair to get live info on
+```
+
+Input directory
+```{r}
+if (temp_dep=="concurrent") {
+  input_dir <- here("data", "9b_shuffled_surrogates_sync")
+  
+} else if (temp_dep == "recurrent") {
+  input_dir <- here("data", "9b_shuffled_surrogates_rcrr")
+  
+} else {
+  print("Error! Temporal dependency has to be 'concurrent' or 'recurrent'")
+}
+``` 
+
+Helpers:
+```{r}
+source("functions/load_or_fit.R")
+
+autoRefit <- function(mod) {
+  convergedCheck = buildmer::converged(mod)
+  
+  attemptNum = 1
+  
+  while (convergedCheck == FALSE) {
+    print(paste("Attempt number", attemptNum))
+    fitVals = getME(mod, "theta")
+    mod <- update(mod, control = strict_tol, start = fitVals)
+    convergedCheck = buildmer::converged(mod)
+    attemptNum = attemptNum + 1
+  }
+  
+  return(mod)
+  
+}
+
+options(scipen = 999, digits = 3)
+
+rescale <- arm::rescale
+lmer <- lmerTest::lmer
+select <- dplyr::select
+
+strict_tol <- lmerControl(optCtrl = list(xtol_abs = 1e-8, ftol_abs = 1e-8))
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(dpi = 600)
+```
+
+Other preparations:
+```{r}
+electrodes <- c(
+  "Fp1", "Fz", "F3", "F7", "FT9", "FC5", "FC1", "C3", "T7", "TP9", 
+  "CP5", "CP1", "Pz", "P3", "P7", "O1", "Oz", "O2", "P4", "P8", 
+  "TP10", "CP6", "CP2", "Cz", "C4", "T8", "FT10", "FC6", "FC2", 
+  "F4", "F8", "Fp2", "FCz"
+)
+
+roi_mapping <- list(
+  "left_anterior" = c("Fp1", "F3", "F7"),
+  "right_anterior" = c("Fp2", "F4", "F8"),
+  "medial_anterior" = c("Fz", "FC1", "FC2", "FCz"),
+  "medial_central" = c("C3", "Cz", "C4", "CP1", "CP2"),
+  "left_temporal" = c("FC5", "T7", "CP5"),
+  "right_temporal" = c("FC6", "T8", "CP6")
+)
+
+roi_ord = c("left_anterior", "medial_anterior", "right_anterior", "medial_central", "left_temporal", "right_temporal")
+
+# Reverse the mapping
+electrode_to_roi <- unlist(lapply(names(roi_mapping), 
+                                  function(x) setNames(rep(x, length(roi_mapping[[x]])),
+                                                       roi_mapping[[x]])))
+
+# Create a dataframe from the mapping
+roi_df <- data.frame(chlabel = names(electrode_to_roi), 
+                     roi = electrode_to_roi, 
+                     stringsAsFactors = FALSE
+) 
+
+```
+
+
+```{r}
+all_Fs <- tibble()
+all_emt <- tibble()
+
+start.time <- Sys.time()
+
+for (i in srr_samples) {
+  df <-
+    readRDS(
+      paste0(
+        input_dir,
+        "/Shuffled_GCMI_",
+        str_to_sentence(freqband),
+        "_",
+        as.character(i),
+        ".RDS"
+      )
+    )
+  
+  names(df)[names(df) %in% c("SyncMI", "RcrrMI")] <- "MI"
+  
+  df_tidy <-
+    df %>%
+    left_join(roi_df, by = c("Channel_A" = "chlabel")) %>%
+    rename(ROI_A = roi) %>%
+    left_join(roi_df, by = c("Channel_B" = "chlabel")) %>%
+    rename(ROI_B = roi) %>%
+    filter(!is.na(ROI_A) & !is.na(ROI_B)) %>%
+    
+    mutate(ROI_pair = paste(ROI_A, ROI_B, sep = "-")) %>%
+    
+    mutate(
+      ROI_B = factor(ROI_B, levels = roi_ord),
+      ROI_A = factor(ROI_A, levels = roi_ord)
+    ) %>%
+    mutate(dplyr::across(
+      c(Channel_A, Channel_B,
+        ROI_A, ROI_B, ROI_pair),
+      ~ as.factor(.)
+    )) %>%
+    
+    mutate(elec_pair = factor(paste(Channel_A, Channel_B, sep = "_"))) %>%
+    
+    # square root-transform GCMI
+    mutate(
+      MI = pmax(MI, 0),
+      sq_MI = sqrt(MI),
+      SurDyad   = factor(paste(DyadA, DyadB, sep = "-")),
+      TrialID = factor(paste(Type, block, SurDyad, sep = "_"))
+    ) %>%
+    select(Band,
+           SurDyad,
+           Speaker,
+           Type,
+           block,
+           PIQ_mean,
+           sq_MI,
+           MI,
+           elec_pair,
+           ROI_pair,
+           TrialID)
+  
+  df_scaled <- df_tidy %>%
+    mutate(sq_MI = as.numeric(scale(sq_MI)),
+           PIQ_mean  = as.numeric(scale(PIQ_mean)))
+  
+  
+  # Model Fit (Same as real analysis)
+  mod <- load_or_fit(
+    model_name = paste0("surr_model_", freqband, "_", temp_dep, "_" , as.character(i)),
+    models_base_dir = "surr_models",
+    modelSpec =
+      "lmer(sq_MI ~ PIQ_mean * ROI_pair +
+                         (1 | SurDyad) + (1 + PIQ_mean | SurDyad : Speaker) +
+                         (1 | elec_pair),
+                       data = df_scaled, REML = F)",
+    max_refit = 10
+  )
+  
+  
+  anova_results <- anova(mod)
+  
+  PIQ_F  <- anova_results$`F value`[1]
+  PIQ_df <- tibble(Fval = PIQ_F,
+                   surr = i)
+  
+  emtrends_mod <- emtrends(
+    mod,
+    ~ ROI_pair,
+    var = "PIQ_mean",
+    lmerTest.limit = 254016,
+    lmer.df = "satterthwaite"
+  )
+  
+  em_results <- summary(
+    emtrends_mod,
+    adjust = "fdr",
+    infer = c(TRUE, TRUE),
+    level = 0.95
+  )
+  
+  
+  em_df <- tibble(
+    ROI_pair = em_results$ROI_pair,
+    coef     = em_results$PIQ_mean.trend,
+    t        = em_results$t.ratio,
+    surr     = i
+  )
+  
+  
+  all_emt <- rbind(all_emt, em_df)
+  all_Fs <- rbind(all_Fs, PIQ_df)
+  
+  passed.time <- Sys.time()
+  time.taken <- passed.time - start.time
+  
+  print(paste0(
+    "Surrogate ",
+    as.character(i),
+    " completed. t = ",
+    as.character(round(em_df[em_df$ROI_pair == which_rois_to_print, ]$t, 2))
+  ))
+  
+  if (show_Fs) {
+    print(paste0("F = ", as.character(round(PIQ_F, 2))))
+  }
+  
+  print(time.taken)
+}
+
+```
+
+```{r}
+saveRDS(
+  all_emt,
+  paste0(
+    "data/10_surrogate_outputs/",
+    freqband,
+    "_",
+    temp_dep,
+    "_",
+    "surrogate_emts.rds"
+  )
+)
+
+saveRDS(
+  all_Fs,
+  paste0(
+    "data/10_surrogate_outputs/",
+    freqband,
+    "_",
+    temp_dep,
+    "_",
+    "surrogate_Fs.rds"
+  )
+)
+```
+
