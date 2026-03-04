@@ -2,7 +2,7 @@
 %  EEG PREPROCESSING PIPELINE (Steps 10-13)
 %
 %  Authors: Peter C.H. Lam & Marcos E. Domínguez Arriola
-%  Repository: https://github.com/elidom/Hyperscanning-Scripts_Engaging-Conversations-Project/tree/main
+%  Repository: https://github.com/elidom/EEG-Hyperscanning-Code_How-do-we-align-in-good-conversations-project
 %  Project: Domínguez-Arriola, Lam, Pérez, & Pell (under review) How Do We Align in Good Conversation?
 % 
 %  EEG Preprocessing steps:
