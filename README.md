@@ -15,8 +15,6 @@ The audio preprocessing pipeline also requires two manual steps: speaker diariza
 
 `04_Analysis` contains the code (in R and R Markdown) used for data wrangling, visualization, and statistical analysis with [lme4](https://cran.r-project.org/web/packages/lme4/lme4.pdf).
 
-Note that most scripts in this repository include a header describing their purpose and functionality.
+`05_Surrogates` contains the control analyses used to generate permutation-based null distributions for the observed neural coordination effects. Note that these scripts require the same `utils` as previous steps.
 
-
-
-
+Most scripts in this repository include a header describing their specific purpose and functionality.
