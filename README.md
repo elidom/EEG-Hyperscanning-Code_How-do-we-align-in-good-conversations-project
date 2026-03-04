@@ -1,6 +1,6 @@
-# EEG Hyperscanning Code Repository. Project: How do we align in good conversation?
+# EEG Hyperscanning Code Repository. How do we align in good conversation?
 
-This repository contains all the code used for data collection, preprocessing, neural speech tracking and neural coordination estimation (processing), and statistical analysis in the manuscript "How Do We Align in Good Conversation? Investigating the Link Between Interaction Quality and Multimodal Interpersonal Coordination" (under review).
+This repository contains all the code used for data collection, preprocessing, neural speech tracking and neural coordination estimation (processing), and statistical analysis in the manuscript "Interpersonal Neural Coordination Tracks Interaction Quality During Naturalistic Conversation" (under review).
 Preprocessed data will be made available upon acceptance of the manuscript for publication.
 
 `01_Experiment` contains the MATLAB script used to run the experiment in an EEG hyperscanning setup, using the [Psychophysics Toolbox Version 3 (PTB-3)](http://psychtoolbox.org/).
@@ -16,6 +16,7 @@ The audio preprocessing pipeline also requires two manual steps: speaker diariza
 `04_Analysis` contains the code (in R and R Markdown) used for data wrangling, visualization, and statistical analysis with [lme4](https://cran.r-project.org/web/packages/lme4/lme4.pdf).
 
 Note that most scripts in this repository include a header describing their purpose and functionality.
+
 
 
 
